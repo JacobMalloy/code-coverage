@@ -25,7 +25,8 @@ RUN apt-get update && apt-get install -y \
     binutils-dev \
     lsb-release \
     software-properties-common \
-    libzstd-dev
+    libzstd-dev \
+    ubuntu-dbgsym-keyring
 
 # Install LLVM 12
 RUN wget https://apt.llvm.org/llvm.sh && \

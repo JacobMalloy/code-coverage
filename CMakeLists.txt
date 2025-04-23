@@ -1,16 +1,12 @@
-cmake_minimum_required(VERSION 3.13)
-project(PrintBBInfoPass)
+cmake_minimum_required(VERSION 3.13.4)
+
+project(MyPass VERSION 0.1 LANGUAGES CXX)
 
 find_package(LLVM REQUIRED CONFIG)
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
 
-add_library(PrintBBInfoPass MODULE PrintBBInfo.cpp)
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
 
-set_target_properties(PrintBBInfoPass PROPERTIES
-    COMPILE_FLAGS "-fno-rtti"
-)
-
-target_include_directories(PrintBBInfoPass PRIVATE ${LLVM_INCLUDE_DIRS})
-target_link_libraries(PrintBBInfoPass PRIVATE LLVMCore LLVMSupport)
-
-llvm_map_components_to_libnames(llvm_libs support core irreader)
-
+add_llvm_pass_plugin(MyPass MyPass.cpp)
