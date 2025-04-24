@@ -4,6 +4,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <llvm/ADT/StringRef.h>
 // #include <llvm/IR/Analysis.h>
 #include <llvm/IR/BasicBlock.h>
@@ -19,50 +20,15 @@
 #include <llvm/IR/Type.h>
 #include <llvm/Support/Alignment.h>
 #include <llvm/Support/AtomicOrdering.h>
+#include <unordered_set>
 
 #include <string>
 
 using namespace llvm;
 
-static void addToGlobalDtors(Module& M, Function* F, int Priority = 0) {
-    LLVMContext& Context = M.getContext();
-
-    // Types
-    Type* i32Ty = Type::getInt32Ty(Context);
-    auto i8PtrTy = PointerType::getInt32Ty(Context);
-    PointerType* funcPtrTy = PointerType::getUnqual(F->getFunctionType());
-
-    // Create entry: { i32, void ()*, i8* }
-    Constant* priorityConst = ConstantInt::get(i32Ty, Priority);
-    Constant* funcBitcast = ConstantExpr::getBitCast(F, funcPtrTy);
-    Constant* nullPtr = ConstantPointerNull::get(PointerType::get(Context, 0));
-    StructType* entryTy = StructType::get(i32Ty, funcPtrTy, i8PtrTy);
-    Constant* entry = ConstantStruct::get(entryTy, priorityConst, funcBitcast, nullPtr);
-
-    // Check if llvm.global_dtors already exists
-    GlobalVariable* globalDtors = M.getNamedGlobal("llvm.global_dtors");
-    std::vector<Constant*> elements;
-
-    if (globalDtors) {
-        // Grab existing initializers
-        if (ConstantArray* arr = dyn_cast<ConstantArray>(globalDtors->getInitializer())) {
-            for (unsigned i = 0; i < arr->getNumOperands(); ++i)
-                elements.push_back(arr->getOperand(i));
-        }
-        globalDtors->eraseFromParent(); // We'll recreate it
-    }
-
-    elements.push_back(entry);
-
-    ArrayType* arrayTy = ArrayType::get(entryTy, elements.size());
-    Constant* newInit = ConstantArray::get(arrayTy, elements);
-
-    new GlobalVariable(M, arrayTy, false, GlobalValue::AppendingLinkage, newInit, "llvm.global_dtors");
-}
-
 static Instruction& get_first_non_phi(BasicBlock& BB) {
     for (auto& ins : BB) {
-        if (!llvm::isa<llvm::PHINode>(ins)) {
+        if (!llvm::isa<llvm::PHINode>(ins) && !llvm::isa<llvm::LandingPadInst>(ins)) {
             return ins;
         }
     }
@@ -73,19 +39,10 @@ static GlobalVariable* createGlobalStringArray(Module& module, const std::vector
     LLVMContext& context = module.getContext();
 
     std::vector<GlobalVariable*> stringGlobals;
+    IRBuilder<> builder(module.getContext());
 
     for (const auto& str : stringVector) {
-        Constant* stringConstant = ConstantDataArray::getString(context, str);
-
-        GlobalVariable* globalStr = new GlobalVariable(
-            module,                       // Module
-            stringConstant->getType(),    // Type (Array of chars)
-            true,                         // Is constant (true)
-            GlobalValue::ExternalLinkage, // Linkage
-            stringConstant,               // Initializer (the string data)
-            ""                            // Name (empty, as it's just a constant)
-        );
-
+        auto globalStr = builder.CreateGlobalString(str, "", 0, &module);
         stringGlobals.push_back(globalStr);
     }
 
@@ -100,9 +57,9 @@ static GlobalVariable* createGlobalStringArray(Module& module, const std::vector
         module,                                            // Module
         arrayType,                                         // Type (Array of pointers)
         true,                                              // Is constant
-        GlobalValue::ExternalLinkage,                      // Linkage
+        GlobalValue::InternalLinkage,                      // Linkage
         ConstantArray::get(arrayType, stringPointerArray), // Initializer
-        "stringArray"                                      // Name
+        "global_string_array"                              // Name
     );
 
     return globalArray;
@@ -135,6 +92,7 @@ struct MyFunctionPass : PassInfoMixin<MyFunctionPass> {
         errs() << F.getName() << " has " << F.size() << " basic blocks\n";
         std::vector<std::string> block_strings;
         for (auto& BB : F) {
+            std::unordered_set<std::string> bbstrings;
             std::vector<Value*> indices = {
                 ConstantInt::get(Type::getInt32Ty(context), 0),
                 ConstantInt::get(Type::getInt32Ty(context), count / 32),
@@ -145,8 +103,20 @@ struct MyFunctionPass : PassInfoMixin<MyFunctionPass> {
             auto or_value = ConstantInt::get(Type::getInt32Ty(context), 1 << (count % 32));
 
             BB_Builder.CreateAtomicRMW(AtomicRMWInst::Or, array_item, or_value, MaybeAlign(4), AtomicOrdering::Monotonic);
+
             errs() << F.getName() << " Basic Block number " << count << "\n";
-            block_strings.push_back(std::string(F.getName()) + "," + std::to_string(count));
+            std::string bb_string = "";
+            for (auto& ins : BB) {
+                const DebugLoc& location = ins.getDebugLoc();
+                if (location) {
+                    bbstrings.insert((F.getName() + "," + std::to_string(count) + "," + location->getDirectory() + "/" + location->getFilename() + "," + std::to_string(location.getLine()) + "," + std::to_string(location.getCol()) + "\n").str());
+                } else {
+                }
+            }
+            for (auto& s : bbstrings) {
+                bb_string += s;
+            }
+            block_strings.push_back(bb_string);
             count += 1;
         }
 
@@ -166,16 +136,16 @@ struct MyFunctionPass : PassInfoMixin<MyFunctionPass> {
         BasicBlock* block19 = BasicBlock::Create(context, "", dtor_func);
         BasicBlock* block23 = BasicBlock::Create(context, "", dtor_func);
 
-        builder.SetInsertPoint(entry);
+        auto arg0 = ConstantInt::get(IntegerType::getInt32Ty(context), basicblockcount);
 
         // Simulate some instructions (icmp, br, phi, etc.)
-        auto arg0 = ConstantInt::get(IntegerType::getInt32Ty(context), basicblockcount);
-        Value* icmpRes = builder.CreateICmpSGT(arg0, ConstantInt::get(Type::getInt32Ty(context), 0), "icmp_res");
-        builder.CreateCondBr(icmpRes, block5, block7);
+        builder.SetInsertPoint(entry);
+        builder.CreateBr(block5);
 
         // Block 5
         builder.SetInsertPoint(block5);
-        Value* zext = builder.CreateZExt(builder.CreateNeg(arg0), Type::getInt64Ty(context), "zext");
+        Value* zext = arg0;
+        // Value* zext = builder.CreateZExt(builder.CreateNeg(arg0), Type::getInt64Ty(context), "zext");
         builder.CreateBr(block8);
 
         // Block 7
@@ -184,36 +154,39 @@ struct MyFunctionPass : PassInfoMixin<MyFunctionPass> {
 
         // Block 8 (phi node and further instructions)
         builder.SetInsertPoint(block8);
-        PHINode* phi = builder.CreatePHI(Type::getInt64Ty(context), 2, "phi");
-        phi->addIncoming(ConstantInt::get(Type::getInt64Ty(context), 0), block5);
+        PHINode* phi = builder.CreatePHI(Type::getInt32Ty(context), 2, "phi");
+        phi->addIncoming(ConstantInt::get(Type::getInt32Ty(context), 0), block5);
 
-        Value* trunc = builder.CreateTrunc(phi, Type::getInt32Ty(context), "trunc");
-        Value* lshr = builder.CreateLShr(phi, ConstantInt::get(Type::getInt64Ty(context), 5), "lshr");
-        Value* and64 = builder.CreateAnd(lshr, ConstantInt::get(Type::getInt64Ty(context), 134217727), "and64");
+        // Value* trunc = builder.CreateTrunc(phi, Type::getInt32Ty(context), "trunc");
+        Value* lshr = builder.CreateLShr(phi, ConstantInt::get(Type::getInt32Ty(context), 5), "lshr");
+        Value* and64 = builder.CreateAnd(lshr, ConstantInt::get(Type::getInt32Ty(context), 134217727), "and64");
         Value* gep2 = builder.CreateGEP(Type::getInt32Ty(context), bitfield_array, and64, "gep2");
         Value* load2 = builder.CreateLoad(Type::getInt32Ty(context), gep2, "load2");
-        Value* and31 = builder.CreateAnd(trunc, ConstantInt::get(Type::getInt32Ty(context), 31), "and31");
+        Value* and31 = builder.CreateAnd(phi, ConstantInt::get(Type::getInt32Ty(context), 31), "and31");
         Value* shl = builder.CreateShl(ConstantInt::get(Type::getInt32Ty(context), 1), and31, "shl");
         Value* mask = builder.CreateAnd(load2, shl, "mask");
         Value* icmpZero = builder.CreateICmpEQ(mask, ConstantInt::get(Type::getInt32Ty(context), 0), "icmp_zero");
-        builder.CreateCondBr(icmpZero, block23, block19);
+        builder.CreateCondBr(icmpZero, block19, block23);
 
         // Block 19: call puts
+        auto zero = ConstantInt::get(IntegerType::getInt32Ty(context), 0);
         builder.SetInsertPoint(block19);
-        Value* gep1 = builder.CreateGEP(PointerType::getInt32Ty(context), string_array, phi, "gep1");
-        Value* load1 = builder.CreateLoad(PointerType::getInt32Ty(context), gep1, "load1");
-        FunctionType* putsType = FunctionType::get(Type::getInt32Ty(context), {PointerType::getInt32Ty(context)}, false);
+
+        Value* gep1 = builder.CreateGEP(PointerType::get(context, 0), string_array, {phi}, "gep1");
+        Value* load1 = builder.CreateLoad(PointerType::get(context, 0), gep1, "load1");
+
+        FunctionType* putsType = FunctionType::get(Type::getInt32Ty(context), {PointerType::get(context, 0)}, false);
         FunctionCallee putsFunc = M->getOrInsertFunction("puts", putsType);
-        builder.CreateCall(putsFunc, load1);
+        builder.CreateCall(putsFunc, {load1});
         builder.CreateBr(block23);
 
         // Block 23: increment loop and condition check
         builder.SetInsertPoint(block23);
-        Value* next = builder.CreateAdd(phi, ConstantInt::get(Type::getInt64Ty(context), 1), "next");
+        Value* next = builder.CreateAdd(phi, ConstantInt::get(Type::getInt32Ty(context), 1), "next");
         phi->addIncoming(next, block23);
         Value* cmp = builder.CreateICmpEQ(next, zext, "cmp");
         builder.CreateCondBr(cmp, block7, block8);
-        addToGlobalDtors(*M, dtor_func, 0);
+        appendToGlobalDtors(*M, dtor_func, 0);
         return PreservedAnalyses::all();
     }
 };

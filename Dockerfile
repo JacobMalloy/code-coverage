@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     clang \
     lldb \
+    gdb \
     git \
     wget \
     curl \
@@ -26,7 +27,8 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     software-properties-common \
     libzstd-dev \
-    ubuntu-dbgsym-keyring
+    ubuntu-dbgsym-keyring \
+    vim \
 
 # Install LLVM 12
 RUN wget https://apt.llvm.org/llvm.sh && \
@@ -35,6 +37,10 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     rm llvm.sh
 
 RUN rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set environment variables for LLVM 12
 ENV CC=clang-18
